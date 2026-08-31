@@ -6,11 +6,49 @@
 #include <string.h>
 
 #ifdef BUILD_ESP32
+#define HOT_MEM_SIZE (64 * 1024)
+#define HOT_MEM_BASE  0x00000000
+static uint8_t s_hot_mem[HOT_MEM_SIZE] __attribute__((section(".dram0.bss")));
+
+static void hot_mem_init(CPUI386 *cpu) {
+    if (cpu->phys_mem) {
+        memcpy(s_hot_mem, cpu->phys_mem + HOT_MEM_BASE, HOT_MEM_SIZE);
+    }
+}
+#endif
+
+
+#ifdef BUILD_ESP32
 #include "esp_attr.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+
+typedef enum {
+    REQ_IO_READ8,
+    REQ_IO_WRITE8,
+    REQ_IO_READ16,
+    REQ_IO_WRITE16,
+    REQ_IO_READ32,
+    REQ_IO_WRITE32,
+} io_request_type_t;
+
+typedef struct {
+    io_request_type_t type;
+    uword addr;
+    u32 value;
+    u32 result;
+    SemaphoreHandle_t sem;
+} io_request_t;
+
+static QueueHandle_t io_queue = NULL;
 #define noinline __attribute__((noinline))
 #else
 #define IRAM_ATTR
 #define IRAM_ATTR_CPU_EXEC1
+#define IRAM_ATTR IRAM_ATTR
+#define IRAM_ATTR_CPU_EXEC1 IRAM_ATTR
 #define DRAM_ATTR
 #define noinline
 #endif
@@ -108,7 +146,11 @@ struct CPUI386 {
 	} sysenter;
 };
 
-#define dolog(...) fprintf(stderr, __VA_ARGS__)
+#ifdef CONFIG_DEBUG_LOG   
+	#define dolog(...) fprintf(stderr, __VA_ARGS__)
+#else
+	#define dolog(...) ((void)0)
+#endif
 #define likely(x) __builtin_expect(!!(x), 1)
 #define unlikely(x) __builtin_expect(!!(x), 0)
 #define wordmask ((uword) ((sword) -1))
@@ -123,6 +165,8 @@ struct CPUI386 {
 #define SET_BIT(w, f, m) ((w) = ((w) & ~((uword)(m))) | ((-(uword)(f)) & (m)))
 //#define SET_BIT(w, f, m) do { if (f) (w) |= (m); else (w) &= ~(m); } while (0)
 
+
+// Exception Table
 enum {
 	EX_DE,
 	EX_DB,
@@ -142,28 +186,29 @@ enum {
 };
 
 enum {
-	CF = 0x1,
+	CF = 0x1, // Carry Flag
 	/* 1 0x2 */
-	PF = 0x4,
+	PF = 0x4, // Parity Flag
 	/* 0 0x8 */
-	AF = 0x10,
+	AF = 0x10, // Auxiliary Carry Flag
 	/* 0 0x20 */
-	ZF = 0x40,
-	SF = 0x80,
-	TF = 0x100,
-	IF = 0x200,
-	DF = 0x400,
-	OF = 0x800,
-	IOPL = 0x3000,
-	NT = 0x4000,
+	ZF = 0x40, // Zero Flag
+	SF = 0x80, // Sign Flag
+	TF = 0x100, // Trap Flag
+	IF = 0x200, // Interrupt Flag
+	DF = 0x400, // Direction Flag
+	OF = 0x800, // Overflow Flag
+	IOPL = 0x3000, // I/O Privilege Level
+	NT = 0x4000, // Nested Task
 	/* 0 0x8000 */
-	RF = 0x10000,
-	VM = 0x20000,
+	RF = 0x10000, // Resume Flag
+	VM = 0x20000, // Virtual 8086 Mode
 };
 
+// Segment Register
 enum {
-	SEG_ES = 0,
-	SEG_CS,
+	SEG_ES = 0, 
+	SEG_CS, 
 	SEG_SS,
 	SEG_DS,
 	SEG_FS,
@@ -208,15 +253,29 @@ static uword sext32(u32 a)
 	return (sword) (s32) a;
 }
 
-static inline u8 pload8(CPUI386 *cpu, uword addr)
+static inline u8 IRAM_ATTR pload8(CPUI386 *cpu, uword addr)
 {
-	return cpu->phys_mem[addr];
+#ifdef BUILD_ESP32
+    if (addr >= HOT_MEM_BASE && addr < HOT_MEM_BASE + HOT_MEM_SIZE) {
+        return s_hot_mem[addr - HOT_MEM_BASE];
+    }
+#endif
+    return cpu->phys_mem[addr];
 }
 
-static inline void pstore8(CPUI386 *cpu, uword addr, u8 val)
+static inline void IRAM_ATTR pstore8(CPUI386 *cpu, uword addr, u8 val)
 {
-	cpu->phys_mem[addr] = val;
+#ifdef BUILD_ESP32
+    if (addr >= HOT_MEM_BASE && addr < HOT_MEM_BASE + HOT_MEM_SIZE) {
+        s_hot_mem[addr - HOT_MEM_BASE] = val;
+        // Keep the main memory in sync (optional but recommended)
+        cpu->phys_mem[addr] = val;
+        return;
+    }
+#endif
+    cpu->phys_mem[addr] = val;
 }
+
 
 #ifdef I386_OPT1
 /* only works on hosts that are little-endian and support unaligned access */
@@ -251,12 +310,15 @@ static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 #else
 static inline u16 pload16(CPUI386 *cpu, uword addr)
 {
-	return *(u16 *)&(cpu->phys_mem[addr]);
+	u16 val;
+	memcpy(&val, &(cpu->phys_mem[addr]), sizeof(val));
+	return val;
 }
-
 static inline u32 pload32(CPUI386 *cpu, uword addr)
 {
-	return *(u32 *)&(cpu->phys_mem[addr]);
+	u32 val;
+	memcpy(&val, &(cpu->phys_mem[addr]), sizeof(val));
+	return val;
 }
 
 static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
@@ -270,31 +332,61 @@ static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
 }
 #endif
 #else
-static inline u16 pload16(CPUI386 *cpu, uword addr)
+static inline u16 IRAM_ATTR pload16(CPUI386 *cpu, uword addr)
 {
-	u8 *mem = (u8 *) cpu->phys_mem;
-	return mem[addr] | (mem[addr + 1] << 8);
+#ifdef BUILD_ESP32
+    if (addr >= HOT_MEM_BASE && addr < HOT_MEM_BASE + HOT_MEM_SIZE) {
+        const uint8_t *p = &s_hot_mem[addr - HOT_MEM_BASE];
+        return (u16)(p[0] | (p[1] << 8));
+    }
+#endif
+    return *(u16 *)&(cpu->phys_mem[addr]);
+}
+static inline u32 IRAM_ATTR pload32(CPUI386 *cpu, uword addr)
+{
+#ifdef BUILD_ESP32
+    if (addr >= HOT_MEM_BASE && addr < HOT_MEM_BASE + HOT_MEM_SIZE) {
+        const uint8_t *p = &s_hot_mem[addr - HOT_MEM_BASE];
+        return (u32)(p[0] | (p[1] << 8) | (p[2] << 16) | (p[3] << 24));
+    }
+#endif
+    return *(u32 *)&(cpu->phys_mem[addr]);
 }
 
-static inline u32 pload32(CPUI386 *cpu, uword addr)
+static inline void IRAM_ATTR pstore16(CPUI386 *cpu, uword addr, u16 val)
 {
-	u8 *mem = (u8 *) cpu->phys_mem;
-	return mem[addr] | (mem[addr + 1] << 8) |
-		(mem[addr + 2] << 16) | (mem[addr + 3] << 24);
+#ifdef BUILD_ESP32
+    if (addr >= HOT_MEM_BASE && addr < HOT_MEM_BASE + HOT_MEM_SIZE) {
+        uint8_t *p = &s_hot_mem[addr - HOT_MEM_BASE];
+        p[0] = val & 0xFF;
+        p[1] = (val >> 8) & 0xFF;
+        cpu->phys_mem[addr] = val & 0xFF;
+        cpu->phys_mem[addr + 1] = (val >> 8) & 0xFF;
+        return;
+    }
+#endif
+    *(u16 *)&(cpu->phys_mem[addr]) = val;
 }
 
-static inline void pstore16(CPUI386 *cpu, uword addr, u16 val)
-{
-	cpu->phys_mem[addr] = val;
-	cpu->phys_mem[addr + 1] = val >> 8;
-}
 
-static inline void pstore32(CPUI386 *cpu, uword addr, u32 val)
+static inline void IRAM_ATTR pstore32(CPUI386 *cpu, uword addr, u32 val)
 {
-	cpu->phys_mem[addr] = val;
-	cpu->phys_mem[addr + 1] = val >> 8;
-	cpu->phys_mem[addr + 2] = val >> 16;
-	cpu->phys_mem[addr + 3] = val >> 24;
+#ifdef BUILD_ESP32
+    if (addr >= HOT_MEM_BASE && addr < HOT_MEM_BASE + HOT_MEM_SIZE) {
+        uint8_t *p = &s_hot_mem[addr - HOT_MEM_BASE];
+        p[0] = val & 0xFF;
+        p[1] = (val >> 8) & 0xFF;
+        p[2] = (val >> 16) & 0xFF;
+        p[3] = (val >> 24) & 0xFF;
+        // Keep main memory in sync
+        cpu->phys_mem[addr]     = val & 0xFF;
+        cpu->phys_mem[addr + 1] = (val >> 8) & 0xFF;
+        cpu->phys_mem[addr + 2] = (val >> 16) & 0xFF;
+        cpu->phys_mem[addr + 3] = (val >> 24) & 0xFF;
+        return;
+    }
+#endif
+    *(u32 *)&(cpu->phys_mem[addr]) = val;
 }
 #endif
 
@@ -3358,35 +3450,73 @@ static bool check_ioperm(CPUI386 *cpu, int port, int bit)
 	return true;
 }
 
+#ifdef BUILD_ESP32
 #define INb(a, b, la, sa, lb, sb) \
-	int port = lb(b); \
-	TRY(check_ioperm(cpu, port, 8)); \
-	sa(a, cpu->cb.io_read8(cpu->cb.io, port));
+    int port = lb(b); \
+    TRY(check_ioperm(cpu, port, 8)); \
+    io_request_t req = { .type = REQ_IO_READ8, .addr = port }; \
+    sa(a, send_io_request(&req));
 
 #define INw(a, b, la, sa, lb, sb) \
-	int port = lb(b); \
-	TRY(check_ioperm(cpu, port, 16)); \
-	sa(a, cpu->cb.io_read16(cpu->cb.io, port));
+    int port = lb(b); \
+    TRY(check_ioperm(cpu, port, 16)); \
+    io_request_t req = { .type = REQ_IO_READ16, .addr = port }; \
+    sa(a, send_io_request(&req));
 
 #define INd(a, b, la, sa, lb, sb) \
-	int port = lb(b); \
-	TRY(check_ioperm(cpu, port, 32)); \
-	sa(a, cpu->cb.io_read32(cpu->cb.io, port));
+    int port = lb(b); \
+    TRY(check_ioperm(cpu, port, 32)); \
+    io_request_t req = { .type = REQ_IO_READ32, .addr = port }; \
+    sa(a, send_io_request(&req));
 
 #define OUTb(a, b, la, sa, lb, sb) \
-	int port = la(a); \
-	TRY(check_ioperm(cpu, port, 8)); \
-	cpu->cb.io_write8(cpu->cb.io, port, lb(b));
+    int port = la(a); \
+    TRY(check_ioperm(cpu, port, 8)); \
+    io_request_t req = { .type = REQ_IO_WRITE8, .addr = port, .value = lb(b) }; \
+    send_io_request(&req);
 
 #define OUTw(a, b, la, sa, lb, sb) \
-	int port = la(a); \
-	TRY(check_ioperm(cpu, port, 16)); \
-	cpu->cb.io_write16(cpu->cb.io, port, lb(b));
+    int port = la(a); \
+    TRY(check_ioperm(cpu, port, 16)); \
+    io_request_t req = { .type = REQ_IO_WRITE16, .addr = port, .value = lb(b) }; \
+    send_io_request(&req);
 
 #define OUTd(a, b, la, sa, lb, sb) \
-	int port = la(a); \
-	TRY(check_ioperm(cpu, port, 32)); \
-	cpu->cb.io_write32(cpu->cb.io, port, lb(b));
+    int port = la(a); \
+    TRY(check_ioperm(cpu, port, 32)); \
+    io_request_t req = { .type = REQ_IO_WRITE32, .addr = port, .value = lb(b) }; \
+    send_io_request(&req);
+#else
+#define INb(a, b, la, sa, lb, sb) \
+    int port = lb(b); \
+    TRY(check_ioperm(cpu, port, 8)); \
+    sa(a, cpu->cb.io_read8(cpu->cb.io, port));
+
+#define INw(a, b, la, sa, lb, sb) \
+    int port = lb(b); \
+    TRY(check_ioperm(cpu, port, 16)); \
+    sa(a, cpu->cb.io_read16(cpu->cb.io, port));
+
+#define INd(a, b, la, sa, lb, sb) \
+    int port = lb(b); \
+    TRY(check_ioperm(cpu, port, 32)); \
+    sa(a, cpu->cb.io_read32(cpu->cb.io, port));
+
+#define OUTb(a, b, la, sa, lb, sb) \
+    int port = la(a); \
+    TRY(check_ioperm(cpu, port, 8)); \
+    cpu->cb.io_write8(cpu->cb.io, port, lb(b));
+
+#define OUTw(a, b, la, sa, lb, sb) \
+    int port = la(a); \
+    TRY(check_ioperm(cpu, port, 16)); \
+    cpu->cb.io_write16(cpu->cb.io, port, lb(b));
+
+#define OUTd(a, b, la, sa, lb, sb) \
+    int port = la(a); \
+    TRY(check_ioperm(cpu, port, 32)); \
+    cpu->cb.io_write32(cpu->cb.io, port, lb(b));
+#endif
 
 #define CLTS() \
 	cpu->cr0 &= ~(1 << 3);
@@ -5105,6 +5235,66 @@ uword cpu_getflags(CPUI386 *cpu)
 	return cpu->flags;
 }
 
+#ifdef BUILD_ESP32
+static void io_core_task(void *arg) {
+    CPUI386 *cpu = (CPUI386 *)arg;
+    io_request_t req;
+    while (1) {
+        if (xQueueReceive(io_queue, &req, portMAX_DELAY) == pdTRUE) {
+            switch (req.type) {
+                case REQ_IO_READ8:
+                    if (cpu->cb.io_read8)
+                        req.result = cpu->cb.io_read8(cpu->cb.io, req.addr);
+                    else
+                        req.result = 0;
+                    break;
+                case REQ_IO_WRITE8:
+                    if (cpu->cb.io_write8)
+                        cpu->cb.io_write8(cpu->cb.io, req.addr, req.value);
+                    req.result = 0;
+                    break;
+                case REQ_IO_READ16:
+                    if (cpu->cb.io_read16)
+                        req.result = cpu->cb.io_read16(cpu->cb.io, req.addr);
+                    else
+                        req.result = 0;
+                    break;
+                case REQ_IO_WRITE16:
+                    if (cpu->cb.io_write16)
+                        cpu->cb.io_write16(cpu->cb.io, req.addr, req.value);
+                    req.result = 0;
+                    break;
+                case REQ_IO_READ32:
+                    if (cpu->cb.io_read32)
+                        req.result = cpu->cb.io_read32(cpu->cb.io, req.addr);
+                    else
+                        req.result = 0;
+                    break;
+                case REQ_IO_WRITE32:
+                    if (cpu->cb.io_write32)
+                        cpu->cb.io_write32(cpu->cb.io, req.addr, req.value);
+                    req.result = 0;
+                    break;
+                default:
+                    break;
+            }
+            xSemaphoreGive(req.sem);
+        }
+    }
+}
+static uint32_t send_io_request(io_request_t *req) {
+    req->sem = xSemaphoreCreateBinary();
+    if (xQueueSend(io_queue, req, 0) != pdTRUE) {
+        vSemaphoreDelete(req->sem);
+        return 0;
+    }
+    xSemaphoreTake(req->sem, portMAX_DELAY);
+    uint32_t res = req->result;
+    vSemaphoreDelete(req->sem);
+    return res;
+}
+#endif
+
 void cpui386_reset(CPUI386 *cpu)
 {
 	for (int i = 0; i < 8; i++) {
@@ -5199,6 +5389,7 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 	cpu->tlb.size = tlb_size;
 #ifdef BUILD_ESP32
 	{
+		
 		extern void *pcmalloc(long size);
 		size_t tlb_bytes = sizeof(struct tlb_entry) * tlb_size;
 		cpu->tlb.tab = malloc(tlb_bytes);
@@ -5211,6 +5402,14 @@ CPUI386 *cpui386_new(int gen, char *phys_mem, long phys_mem_size, CPU_CB **cb)
 
 	cpu->phys_mem = (u8 *) phys_mem;
 	cpu->phys_mem_size = phys_mem_size;
+
+	#ifdef BUILD_ESP32
+    	hot_mem_init(cpu);
+		io_queue = xQueueCreate(32, sizeof(io_request_t));
+    	if (io_queue != NULL){
+        	xTaskCreatePinnedToCore(io_core_task, "io_core", 4096, cpu, 5, NULL, 1);
+    	}
+		#endif
 
 	cpu->cycle = 0;
 
