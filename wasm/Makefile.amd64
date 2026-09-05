@@ -17,6 +17,7 @@ main.c \
 ../pcspk.c \
 ../pci.c \
 ../pc.c \
+../swap.c \
 libc/libc.c libc/compiler-rt.c
 
 CFLAGS = -DUSE_AMD64

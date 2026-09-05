@@ -412,33 +412,43 @@ int i8257_dma_read_memory(IsaDma *obj, int nchan, void *buf, int pos,
         return len;
     }
 
+    if (len <= 0) {
+        return len;
+    }
+
     uint8_t *p = buf;
+    hwaddr start = (r->mode & 0x20) ? addr - pos - len : addr + pos;
+    /* Page-chunked copy: each chunk lies within a single guest page so a
+     * paged-out region (swap) can be brought in chunk by chunk. */
+    hwaddr off = 0;
+    while (off < (hwaddr) len) {
+        hwaddr g = start + off;
+        if (g >= (hwaddr) d->phys_mem_size)
+            break;
+        uint32_t chunk = 4096 - (g & 4095);
+        if (chunk > (uint32_t)(len - off))
+            chunk = len - off;
+        if (g + chunk > (hwaddr) d->phys_mem_size)
+            chunk = (uint32_t) d->phys_mem_size - g;
+        if (d->swap)
+            memcpy(p + off, swap_ptr(d->swap, g, 0), chunk);
+        else
+            memcpy(p + off, d->phys_mem + g, chunk);
+        off += chunk;
+    }
     if (r->mode & 0x20) {
-        for (hwaddr i = 0;
-             addr - pos - len + i < d->phys_mem_size && i < len;
-             i++) {
-            p[i] = d->phys_mem[addr - pos - len + i];
-        }
-        //cpu_physical_memory_read (d->phys_mem + addr - pos - len, buf, len);
         /* What about 16bit transfers? */
         for (int i = 0; i < len >> 1; i++) {
             uint8_t b = p[len - i - 1];
             p[i] = b;
         }
-    } else {
-        for (hwaddr i = 0;
-             addr + pos + i < d->phys_mem_size && i < len;
-             i++) {
-            p[i] = d->phys_mem[addr + pos + i];
-        }
-        //cpu_physical_memory_read (addr + pos, buf, len);
     }
 
     return len;
 }
 
 int i8257_dma_write_memory(IsaDma *obj, int nchan, void *buf, int pos,
-                           int len)
+                            int len)
 {
     I8257State *s = I8257(obj);
     I8257Regs *r = &s->regs[nchan & 3];
@@ -448,26 +458,34 @@ int i8257_dma_write_memory(IsaDma *obj, int nchan, void *buf, int pos,
         return len;
     }
 
+    if (len <= 0) {
+        return len;
+    }
+
     uint8_t *p = buf;
+    hwaddr start = (r->mode & 0x20) ? addr - pos - len : addr + pos;
+    hwaddr off = 0;
+    while (off < (hwaddr) len) {
+        hwaddr g = start + off;
+        if (g >= (hwaddr) s->phys_mem_size)
+            break;
+        uint32_t chunk = 4096 - (g & 4095);
+        if (chunk > (uint32_t)(len - off))
+            chunk = len - off;
+        if (g + chunk > (hwaddr) s->phys_mem_size)
+            chunk = (uint32_t) s->phys_mem_size - g;
+        if (s->swap)
+            memcpy(swap_ptr(s->swap, g, 1), p + off, chunk);
+        else
+            memcpy(s->phys_mem + g, p + off, chunk);
+        off += chunk;
+    }
     if (r->mode & 0x20) {
-        for (hwaddr i = 0;
-             addr - pos - len + i < s->phys_mem_size && i < len;
-             i++) {
-            s->phys_mem[addr - pos - len + i] = p[i];
-        }
-        //cpu_physical_memory_write (addr - pos - len, buf, len);
         /* What about 16bit transfers? */
         for (int i = 0; i < len; i++) {
             uint8_t b = p[len - i - 1];
             p[i] = b;
         }
-    } else {
-        for (hwaddr i = 0;
-             addr + pos + i < s->phys_mem_size && i < len;
-             i++) {
-            s->phys_mem[addr + pos + i] = p[i];
-        }
-        //cpu_physical_memory_write (addr + pos, buf, len);
     }
 
     return len;
@@ -649,6 +667,7 @@ void i8257_dma_init(ISABus *bus, bool high_page_enable)
 I8257State *i8257_new(
     char *phys_mem,
     long phys_mem_size,
+    Swap *swap,
     int base, int page_base, int pageh_base, int dshift)
 {
     I8257State *d = malloc(sizeof(I8257State));
@@ -659,6 +678,7 @@ I8257State *i8257_new(
     d->dshift = dshift;
     d->phys_mem = phys_mem;
     d->phys_mem_size = phys_mem_size;
+    d->swap = swap;
     int i;
 
 //    memory_region_init_io(&d->channel_io, OBJECT(dev), &channel_io_ops, d,

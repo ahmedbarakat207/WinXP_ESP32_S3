@@ -2,6 +2,7 @@
 #define HW_I8257_H
 #include <stdbool.h>
 #include <stdint.h>
+#include "swap.h"
 typedef int (*IsaDmaTransferHandler)(void *opaque, int nchan, int dma_pos, int dma_len);
 
 typedef struct I8257Regs {
@@ -29,6 +30,7 @@ typedef struct I8257State {
     I8257Regs regs[4];
     char *phys_mem;
     long phys_mem_size;
+    Swap *swap; /* NULL = direct phys_mem access (no paging) */
 //    MemoryRegion channel_io;
 //    MemoryRegion cont_io;
 
@@ -68,6 +70,6 @@ int i8257_dma_write_memory(IsaDma *obj, int nchan, void *buf, int pos,
                            int len);
 
 I8257State *i8257_new(
-    char *phys_mem, long phys_mem_size,
+    char *phys_mem, long phys_mem_size, Swap *swap,
     int base, int page_base, int pageh_base, int dshift);
 #endif

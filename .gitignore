@@ -2,3 +2,16 @@
 *.o
 .depends
 fmopl.inc
+*.img
+*.bak
+.DS_Store
+tiny386
+tiny386_sdl
+tiny386_rawdraw
+tiny386_headless
+wifikbd
+wifikbd_sdl
+wifikbd_rawdraw
+initnet
+*.exe
+*.dSYM/

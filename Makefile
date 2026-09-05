@@ -8,7 +8,12 @@ SDL_CONFIG = sdl-config
 SLIRP_INC =
 SLIRP_LIB = -lslirp
 
-CFLAGS = -I . -Wall -O3 -ffunction-sections -fdata-sections -g -Wl,--gc-sections
+CFLAGS = -I . -Wall -O3 -ffunction-sections -fdata-sections -g
+ifeq ($(shell uname),Darwin)
+CFLAGS += -Wl,-dead_strip
+else
+CFLAGS += -Wl,--gc-sections
+endif
 CFLAGS += -DI386_ENABLE_FPU
 CFLAGS += -DI386_ENABLE_MMX -DI386_ENABLE_SSE -DI386_ENABLE_SSE2 -DI386_ENABLE_SSE3
 CFLAGS += -DI386_ENABLE_SSSE3
@@ -104,6 +109,7 @@ PROGS_win32 = tiny386 tiny386_headless wifikbd
 PROGS = ${PROGS_${PLAT}}
 
 SRCS += ini.c fpu.c i8259.c i8254.c ide.c vga.c i8042.c misc.c adlib.c ne2000.c i8257.c sb16.c pcspk.c
+SRCS += swap.c
 SRCS += ${FMOPL_${USE_FMOPL}}
 SRCS += ${CPUABS_${USE_CPUABS}}
 SRCS += pc.c

@@ -17,6 +17,7 @@ main.c \
 ../pcspk.c \
 ../pci.c \
 ../pc.c \
+../swap.c \
 libc/libc.c
 
 CFLAGS =

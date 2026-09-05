@@ -1,6 +1,8 @@
 #ifndef PC_H
 #define PC_H
 
+#include "swap.h"
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -54,6 +56,7 @@ typedef struct {
 	long phys_mem_size;
 	char *vga_mem;
 	int vga_mem_size;
+	Swap *swap; /* NULL unless guest RAM is paged to a swap file */
 	int64_t boot_start_time;
 
 	SimpleFBDrawFunc *redraw;
@@ -103,6 +106,8 @@ typedef struct {
 	const char *vga_bios;
 	long mem_size;
 	long vga_mem_size;
+	long swap_size; /* resident window, 0 = no swapping */
+	const char *swap_file; /* backing file, "" = platform default */
 	const char *disks[4];
 	int iscd[4];
 	const char *fdd[2];

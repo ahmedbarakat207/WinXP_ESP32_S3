@@ -710,15 +710,63 @@ static void pc_reset_request(void *p)
 	pc->reset_request = 1;
 }
 
+static void *swap_alloc(long size)
+{
+	return bigmalloc((size_t) size);
+}
+
+#ifdef BUILD_ESP32
+#define SWAP_DEFAULT_FILE "/sdcard/xpswap.bin"
+#else
+#define SWAP_DEFAULT_FILE "/tmp/xpswap.bin"
+#endif
+/* Guest low memory kept permanently resident (firmware, BIOS data, boot). */
+#define SWAP_PIN_SIZE (2 * 1024 * 1024)
+
 PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 	   u8 *fb, PCConfig *conf)
 {
 	PC *pc = malloc(sizeof(PC));
-	char *mem = bigmalloc(conf->mem_size);
 	CPU_CB *cb = NULL;
-	memset(mem, 0, conf->mem_size);
+	pc->swap = NULL;
+	char *mem;
+	if (conf->swap_size > 0 && conf->swap_size < conf->mem_size) {
+		const char *path = conf->swap_file && conf->swap_file[0] ?
+			conf->swap_file : SWAP_DEFAULT_FILE;
+		pc->swap = swap_create((uint32_t) conf->mem_size,
+				       (uint32_t) conf->swap_size,
+				       path, SWAP_PIN_SIZE,
+				       NULL, NULL, swap_alloc);
+		mem = (char *) swap_resident_base(pc->swap);
+		fprintf(stderr, "swap: guest %ldMB, resident %ldMB, file %s\n",
+			conf->mem_size / (1024 * 1024),
+			conf->swap_size / (1024 * 1024), path);
+	} else {
+		if (conf->swap_size > 0)
+			fprintf(stderr, "swap: resident window covers all RAM, swap off\n");
+		mem = bigmalloc(conf->mem_size);
+		memset(mem, 0, conf->mem_size);
+	}
 	pcmalloc_init(mem + 0xa0000, 0xc0000 - 0xa0000);
+#if defined(USE_CPUABS)
+	if (pc->swap && conf->cpu_gen < 0) {
+		fprintf(stderr, "swap requires the interpreter CPU, not KVM\n");
+		abort();
+	}
+#endif
 	pc->cpu = cpu_new(conf->cpu_gen, mem, conf->mem_size, &cb);
+	if (pc->swap) {
+#if defined(USE_CPUABS)
+		cpui386_set_swap(pc->cpu->cpu, pc->swap);
+		swap_bind(pc->swap, pc->cpu->cpu, cpui386_swap_invalidate);
+#elif !defined(USE_AMD64)
+		cpui386_set_swap(pc->cpu, pc->swap);
+		swap_bind(pc->swap, pc->cpu, cpui386_swap_invalidate);
+#else
+		fprintf(stderr, "swap supports the i386 CPU model only\n");
+		abort();
+#endif
+	}
 	if (conf->fpu)
 		cpu_enable_fpu(pc->cpu);
 #if defined(USE_AMD64)
@@ -829,9 +877,9 @@ PC *pc_new(SimpleFBDrawFunc *redraw, void *redraw_data,
 			       pc, pc_reset_request);
 	pc->adlib = adlib_new();
 	pc->ne2000 = isa_ne2000_init(0x300, 9, pc->pic, set_irq);
-	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size,
+	pc->isa_dma = i8257_new(pc->phys_mem, pc->phys_mem_size, pc->swap,
 				0x00, 0x80, 0x480, 0);
-	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size,
+	pc->isa_hdma = i8257_new(pc->phys_mem, pc->phys_mem_size, pc->swap,
 				 0xc0, 0x88, 0x488, 1);
 	pc->sb16 = sb16_new(0x220, 5,
 			    pc->isa_dma, pc->isa_hdma,
@@ -901,6 +949,15 @@ void load_bios_and_reset(PC *pc)
 	} else {
 		cpu_reset(pc->cpu);
 	}
+#ifdef BUILD_ESP32
+	/* ROM/command-line bytes were written straight into guest frames;
+	 * re-sync the internal-RAM hot mirror covering low memory. */
+#if defined(USE_CPUABS)
+	cpui386_hot_sync(pc->cpu->cpu);
+#elif !defined(USE_AMD64)
+	cpui386_hot_sync(pc->cpu);
+#endif
+#endif
 }
 
 static long parse_mem_size(const char *value)
@@ -932,6 +989,10 @@ int parse_conf_ini(void* user, const char* section,
 			conf->mem_size = parse_mem_size(value);
 		} else if (NAME("vga_mem_size")) {
 			conf->vga_mem_size = parse_mem_size(value);
+		} else if (NAME("swap_size")) {
+			conf->swap_size = parse_mem_size(value);
+		} else if (NAME("swap_file")) {
+			conf->swap_file = strdup(value);
 		} else if (NAME("hda")) {
 			conf->disks[0] = strdup(value);
 			conf->iscd[0] = 0;

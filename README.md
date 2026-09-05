@@ -33,6 +33,8 @@ To build with display and sound:
 - Linux (with rawdraw): Install `libslirp`, `libx11`, and `libasound2` first, then run `make`.
 - Linux (with SDL): Install `libslirp` `SDL1.2` (or `sdl12-compat`) first, then run `make USE_SDL=y`.
 - Windows: Install `mingw-w64` first, then run `make win32`.
+- macOS (with SDL): Install `libslirp` and `SDL1.2` from Homebrew first,
+  then run `make USE_SDL=y SLIRP_INC="-I/opt/homebrew/include" SLIRP_LIB="$(pkg-config --libs slirp)"`.
 - WebAssembly: Install `clang` first, then run `cd wasm; make`.
 
 For details, please refer to `.github/workflows/build.yml` and `Makefile`.
@@ -137,6 +139,91 @@ enable_usb = 1
 Note: DO NOT enable USB and WIFI at the same time on ESP32-S3, due to insufficient memory.
 
 More info, see [here](https://github.com/hchunhui/tiny386/pull/4).
+
+### Windows XP on ESP32-S3 (SD card + RAM paging)
+
+Runs a 16MB Windows XP guest on ESP32-S3 by paging guest RAM to a swap
+file on the SD card. Validated on PC builds (16MB guest, 6MB resident
+window, boots to idle with zero faults); the ESP target uses the same
+code paths with the window sized from actual PSRAM.
+
+#### Guest requirements
+
+- Windows XP with the Standard PC HAL. The bundled SeaBIOS is built
+  with `CONFIG_ACPI` unset, so it exposes no ACPI tables and an
+  ACPI-HAL image bugchecks during init. Convert in QEMU
+  (Device Manager -> Computer -> Update Driver -> "Standard PC"),
+  then shut down cleanly.
+- 16MB RAM (`mem_size = 16M`, checked with `qemu-system-i386 -m 16M`),
+  `gen = 5`, `fpu = 1`, `fill_cmos = 0`, `vga_mem_size = 320K`.
+
+#### Host constraints (S3)
+
+- 240MHz LX7, 512KB internal SRAM, 8 or 16MB octal PSRAM. 16MB of
+  guest RAM does not fit alongside the emulator, VGA memory (320KB),
+  BIOS images (~170KB) and the frame buffer (640x480x2 = 600KB).
+- External SPI SD module for the disk image and the swap file.
+
+#### Pager design (`swap.c`, `swap.h`)
+
+- Page size 4096. Resident window of N frames in host RAM, backing
+  file holds up to `mem_size` bytes at offset `page * 4096`.
+- The low 2MB is pinned (identity-mapped prefix): firmware, BIOS data
+  and boot code never touch the SD card.
+- Clean pages without a backing copy read back as zeros; the swap file
+  needs no preallocation. Out-of-range reads return zeros, writes are
+  discarded (same as flat-RAM behavior).
+- Eviction is clock (second chance); use bits are fed on every
+  translation, including TLB hits. Only host-dirty pages are written
+  back; guest Accessed-bit updates are intentionally not persisted.
+- All guest-physical access paths go through it: CPU loads/stores, TLB
+  refill (page-table reads, guest dirty-bit writeback via tracked PTE
+  pages), fetch-cache guards against cross-page reads, page-clamped
+  string I/O with pinning, page-chunked ISA DMA (`i8257.c`).
+  Eviction invalidates TLB entries, stale PTE pointers and the fetch
+  cache (`cpui386_swap_invalidate`).
+
+#### CPU changes (`i386.c`)
+
+- Fault during exception/interrupt delivery raises double fault; fault
+  during double fault delivery resets the CPU (triple fault). Delivery
+  paths return failure instead of aborting, so guest handlers run.
+- Fixed multi-byte stores bypassing the internal-RAM hot mirror on
+  ESP32 (`hot_mirror_store`) and a self-referential `IRAM_ATTR`
+  definition that broke non-ESP builds.
+
+#### ESP integration
+
+- `esp/main/board_s3devkit.h`: headless 640x480 target (`USE_LCD_HEADLESS`,
+  `lcd_headless.c`), SPI SD pins (`SD_SPI_MOSI/MISO/SCK/CS`, adjust to
+  wiring), USB HID input (`enable_usb = 1`, never together with WiFi).
+- `esp/tiny386_xp.ini`: the 16MB guest config. New ini keys
+  `swap_size` (resident window, 0 = auto) and `swap_file`.
+- `swap_size = 0` auto-enables paging only when the guest does not fit:
+  `window = psram - fb - vga_mem - 2MB`, floored at 2.5MB. Guests that
+  fit run fully in PSRAM as before. Boot log prints the numbers.
+
+#### Validation (PC builds)
+
+- Pager unit test: 20000 random reads/writes over 64 pages in an
+  8-frame window vs a flat reference model, plus pin and
+  out-of-range cases. Passes.
+- Forced swap (16MB guest, 6MB window): boots to idle (~90s on the
+  test machine, ~34% CPU at idle), zero aborts/faults, 16MB swap file
+  fully exercised.
+- Baseline (128MB guest, no swap): same boot milestones, zero faults.
+
+#### Operation
+
+- SD card (FAT32/exFAT): `tiny386.ini` (copy of `esp/tiny386_xp.ini`),
+  `bios.bin`, `vgabios.bin`, `xp.img`. `xpswap.bin` is created
+  automatically. Use a spare card; paging wears flash.
+- Build: `idf.py -DBOARD=s3devkit build` (ESP-IDF 5.2, after
+  `scripts/build.sh patch_idf` and `make prepare`).
+- Limits: expect hours to boot on 8MB PSRAM over SPI SD (each 4KB
+  swap costs milliseconds; the boot working set exceeds the window).
+  16MB PSRAM or SDMMC 4-bit wiring reduces this proportionally. No
+  display on the devkit build; progress goes over serial logs.
 
 ## Troubleshooting
 

@@ -3,6 +3,7 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "swap.h"
 
 typedef uint32_t u32;
 typedef uint16_t u16;
@@ -63,5 +64,14 @@ void cpu_setexc(CPUI386 *cpu, int excno, uword excerr);
 void cpu_setflags(CPUI386 *cpu, uword set_mask, uword clear_mask);
 uword cpu_getflags(CPUI386 *cpu);
 void cpu_abort(CPUI386 *cpu, int code);
+/* Guest-RAM paging (swap): NULL disables, otherwise all physical accesses
+ * are routed through the resident window. */
+void cpui386_set_swap(CPUI386 *cpu, Swap *swap);
+/* Invalidate callback for the pager (drops TLB/fetch caches for a page). */
+void cpui386_swap_invalidate(void *cpu, uword lpgno);
+#ifdef BUILD_ESP32
+/* Re-sync the internal-RAM hot mirror from guest RAM (after ROM loads). */
+void cpui386_hot_sync(CPUI386 *cpu);
+#endif
 
 #endif /* I386_H */

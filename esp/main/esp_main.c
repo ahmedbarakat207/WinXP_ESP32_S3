@@ -111,6 +111,7 @@ Console *console_init(int width, int height)
 }
 
 void lcd_draw(int x_start, int y_start, int x_end, int y_end, void *src);
+static long psram_len; /* defined below; total PSRAM bytes for the emulator */
 static void redraw(void *opaque,
 		   int x, int y, int w, int h)
 {
@@ -148,6 +149,28 @@ static int pc_main(const char *file)
 		conf.width = LCD_WIDTH;
 		conf.height = LCD_HEIGHT;
 	}
+
+#ifdef BUILD_ESP32
+	/* Auto-enable SD-backed paging when the guest does not fit in PSRAM
+	 * (e.g. 16MB XP on an 8MB module) and the ini leaves swap_size = 0.
+	 * Guests that fit keep running fully in PSRAM, as before. */
+	if (conf.swap_size == 0 && conf.mem_size > psram_len) {
+		long fb = (long) LCD_WIDTH * LCD_HEIGHT * 2;
+		long reserve = fb + conf.vga_mem_size + 2 * 1024 * 1024;
+		long window = psram_len - reserve;
+		window &= ~0xfffL;
+		fprintf(stderr, "psram total %ldKB, auto swap window %ldKB\n",
+			psram_len / 1024, window / 1024);
+		if (window < 2 * 1024 * 1024 + 512 * 1024) {
+			fprintf(stderr, "auto swap: not enough PSRAM (%ldKB), "
+				"reduce mem_size\n", psram_len / 1024);
+			abort();
+		}
+		conf.swap_size = window;
+		if (!conf.swap_file || !conf.swap_file[0])
+			conf.swap_file = "/sdcard/xpswap.bin";
+	}
+#endif
 
 	Console *console = console_init(conf.width, conf.height);
 	PC *pc = pc_new(redraw, console, console->fb, &conf);
@@ -200,7 +223,6 @@ static void i386_task(void *arg)
 
 static char *psram;
 static long psram_off;
-static long psram_len;
 void *psmalloc(long size)
 {
 	void *ret = psram + psram_off;
